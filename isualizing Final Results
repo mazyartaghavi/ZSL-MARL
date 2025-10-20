@@ -1,0 +1,125 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def load_feedback_log(file_name="uav_feedback_log.csv"):
+    """
+    Load the feedback log data from the CSV file.
+    """
+    return pd.read_csv(file_name)
+
+def plot_reward_vs_uncertainty(data):
+    """
+    Plot the reward vs uncertainty to observe the relationship between performance and model confidence.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(data["Timestamp"], data["Reward"], label="Reward", color='b', alpha=0.6)
+    plt.plot(data["Timestamp"], data["Uncertainty"], label="Uncertainty (logvar)", color='r', alpha=0.6)
+    plt.xlabel("Timestamp (s)")
+    plt.ylabel("Value")
+    plt.title("Reward vs Uncertainty Over Time")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_action_distribution(data):
+    """
+    Plot the distribution of control actions over time.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(data["Timestamp"], data["Action"].apply(lambda x: x[0]), label="Action x (Linear velocity)", color='g')
+    plt.plot(data["Timestamp"], data["Action"].apply(lambda x: x[1]), label="Action y (Linear velocity)", color='m')
+    plt.plot(data["Timestamp"], data["Action"].apply(lambda x: x[2]), label="Action z (Altitude)", color='c')
+    plt.plot(data["Timestamp"], data["Action"].apply(lambda x: x[3]), label="Action yaw (Angular velocity)", color='y')
+    plt.xlabel("Timestamp (s)")
+    plt.ylabel("Action Magnitude")
+    plt.title("Control Actions Distribution Over Time")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_uncertainty_over_time(data):
+    """
+    Plot uncertainty over time to understand how the model's confidence evolves.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(data["Timestamp"], data["Uncertainty"], label="Uncertainty (logvar)", color='r')
+    plt.xlabel("Timestamp (s)")
+    plt.ylabel("Uncertainty")
+    plt.title("Uncertainty Evolution Over Time")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_multi_metric_comparison(data):
+    """
+    Compare multiple metrics (e.g., Reward, Uncertainty) during the experiment's feedback loop.
+    """
+    fig, axes = plt.subplots(2, 1, figsize=(10, 12))
+
+    # Reward vs Uncertainty Comparison
+    sns.lineplot(x='Timestamp', y='Reward', data=data, label="Reward", ax=axes[0], color='b')
+    sns.lineplot(x='Timestamp', y='Uncertainty', data=data, label="Uncertainty", ax=axes[0], color='r')
+    axes[0].set_title("Reward and Uncertainty Comparison Over Time")
+    axes[0].set_xlabel("Timestamp (s)")
+    axes[0].set_ylabel("Metric Value")
+    axes[0].grid(True)
+
+    # Action Distribution Comparison
+    sns.lineplot(x='Timestamp', y='Action', data=data, label="Action x (linear velocity)", ax=axes[1], color='g')
+    sns.lineplot(x='Timestamp', y='Action', data=data, label="Action y (linear velocity)", ax=axes[1], color='m')
+    axes[1].set_title("Control Actions Over Time")
+    axes[1].set_xlabel("Timestamp (s)")
+    axes[1].set_ylabel("Action Magnitude")
+    axes[1].grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+def save_plots(file_name="final_experiment_results.png"):
+    """
+    Save all visualizations into a single image for reporting purposes.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Reward vs Uncertainty
+    plot_reward_vs_uncertainty(axes[0, 0])
+
+    # Action Distribution
+    plot_action_distribution(axes[0, 1])
+
+    # Uncertainty Evolution
+    plot_uncertainty_over_time(axes[1, 0])
+
+    # Multi-Metric Comparison
+    plot_multi_metric_comparison(axes[1, 1])
+
+    plt.tight_layout()
+    plt.savefig(file_name)
+    plt.close()
+    print(f"Plots saved to {file_name}")
+
+def main():
+    log_file = "uav_feedback_log.csv"
+    data = load_feedback_log(log_file)
+    
+    # Generate individual plots
+    plot_reward_vs_uncertainty(data)
+    plot_action_distribution(data)
+    plot_uncertainty_over_time(data)
+
+    # Save combined plots for reporting
+    save_plots(file_name="final_experiment_results.png")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+python visualize_feedback_results.py
+
+
+
+
+
