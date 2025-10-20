@@ -1,0 +1,212 @@
+import numpy as np
+import torch
+from torch import nn
+
+class PartialObservableEnv:
+    """
+    Custom environment simulating partial observability.
+    Each agent observes a noisy local view of the global state.
+    """
+
+    def __init__(self, n_agents=5, state_dim=10, action_dim=4, noise_std=0.1):
+        self.n_agents = n_agents
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.noise_std = noise_std
+        self.state = np.zeros((n_agents, state_dim))
+
+    def reset(self):
+        self.state = np.random.uniform(-1, 1, (self.n_agents, self.state_dim))
+        return self._get_observation()
+
+    def _get_observation(self):
+        noise = np.random.normal(0, self.noise_std, self.state.shape)
+        return self.state + noise
+
+    def step(self, actions):
+        rewards = np.zeros(self.n_agents)
+        for i, a in enumerate(actions):
+            self.state[i] += np.random.uniform(-0.05, 0.05, self.state_dim)
+            rewards[i] = -np.linalg.norm(self.state[i])  # minimize distance to origin
+        next_obs = self._get_observation()
+        done = False
+        return next_obs, rewards, done, {}
+
+class ZSM2RLAgent(nn.Module):
+    """
+    Agent with stochastic meta-policy using Bayesian embedding.
+    """
+
+    def __init__(self, state_dim, action_dim, latent_dim=16):
+        super(ZSM2RLAgent, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(state_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, latent_dim)
+        )
+        self.policy = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_dim),
+            nn.Softmax(dim=-1)
+        )
+
+    def forward(self, obs):
+        latent = self.encoder(obs)
+        return self.policy(latent)
+
+
+import torch
+from torch import nn, optim
+import numpy as np
+from env_agent import PartialObservableEnv, ZSM2RLAgent
+
+class StochasticMetaLearner:
+    """
+    Core class for the ZSM²RL meta-learning framework.
+    Incorporates stochastic gradient updates for uncertainty-aware adaptation.
+    """
+
+    def __init__(self, n_agents=5, state_dim=10, action_dim=4, latent_dim=16, lr=3e-4, meta_lr=1e-4):
+        self.env = PartialObservableEnv(n_agents, state_dim, action_dim)
+        self.agents = [ZSM2RLAgent(state_dim, action_dim, latent_dim) for _ in range(n_agents)]
+        self.optimizers = [optim.Adam(agent.parameters(), lr=lr) for agent in self.agents]
+        self.meta_optimizer = optim.Adam(
+            [p for agent in self.agents for p in agent.parameters()],
+            lr=meta_lr
+        )
+        self.gamma = 0.95  # discount factor
+        self.beta = 0.1    # uncertainty regularization term
+
+    def sample_episode(self, agent, max_steps=100):
+        obs = torch.tensor(self.env.reset(), dtype=torch.float32)
+        log_probs, rewards = [], []
+        for _ in range(max_steps):
+            action_probs = agent(obs)
+            dist = torch.distributions.Categorical(action_probs)
+            actions = dist.sample()
+            log_prob = dist.log_prob(actions)
+            next_obs, reward, done, _ = self.env.step(actions.numpy())
+            obs = torch.tensor(next_obs, dtype=torch.float32)
+            log_probs.append(log_prob)
+            rewards.append(torch.tensor(reward, dtype=torch.float32))
+            if done:
+                break
+        return log_probs, rewards
+
+    def compute_returns(self, rewards):
+        returns = []
+        for r in reversed(rewards):
+            R = r + self.gamma * (returns[-1] if returns else 0)
+            returns.insert(0, R)
+        return returns
+
+    def meta_update(self, log_probs, returns):
+        policy_loss = torch.stack(
+            [-lp.sum() * R.mean() for lp, R in zip(log_probs, returns)]
+        ).mean()
+        self.meta_optimizer.zero_grad()
+
+
+continue with A3 (Zero-Shot Evaluation & Adaptation Code — evaluate_zero_shot.py)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GraphMessagePassing(nn.Module):
+    """
+    Message passing layer for communication among partially observable agents.
+    Each agent exchanges latent state encodings with neighbors within communication radius.
+    """
+    def __init__(self, input_dim, hidden_dim):
+        super(GraphMessagePassing, self).__init__()
+        self.msg_encoder = nn.Linear(input_dim, hidden_dim)
+        self.msg_aggregator = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, node_features, adjacency_matrix):
+        """
+        node_features: Tensor [N, d]
+        adjacency_matrix: Tensor [N, N] binary (1 if communication link exists)
+        """
+        encoded = F.relu(self.msg_encoder(node_features))
+        aggregated = torch.matmul(adjacency_matrix, encoded) / (adjacency_matrix.sum(1, keepdim=True) + 1e-6)
+        updated = F.relu(self.msg_aggregator(aggregated))
+        return updated
+
+
+class ConsensusUpdate(nn.Module):
+    """
+    Distributed consensus update for shared state estimation among agents.
+    """
+    def __init__(self, dim):
+        super(ConsensusUpdate, self).__init__()
+        self.W = nn.Parameter(torch.eye(dim))  # learnable mixing matrix
+
+    def forward(self, local_beliefs, comm_weights):
+        """
+        local_beliefs: [N, d] — each agent’s belief vector
+        comm_weights: [N, N] — adjacency or communication strength
+        """
+        consensus = torch.matmul(comm_weights, local_beliefs) / (comm_weights.sum(1, keepdim=True) + 1e-6)
+        updated_beliefs = torch.matmul(consensus, self.W)
+        return updated_beliefs
+
+
+class CommunicationAwareController(nn.Module):
+    """
+    High-level coordination mechanism integrating message passing and consensus updates.
+    This module enables adaptive communication under partial observability.
+    """
+    def __init__(self, n_agents, state_dim, hidden_dim, comm_radius=0.6):
+        super(CommunicationAwareController, self).__init__()
+        self.n_agents = n_agents
+        self.state_dim = state_dim
+        self.hidden_dim = hidden_dim
+        self.comm_radius = comm_radius
+
+        self.encoder = nn.Linear(state_dim, hidden_dim)
+        self.msg_passing = GraphMessagePassing(hidden_dim, hidden_dim)
+        self.consensus = ConsensusUpdate(hidden_dim)
+        self.policy_head = nn.Linear(hidden_dim, state_dim)
+
+    def compute_adjacency(self, positions):
+        """
+        Build adjacency matrix dynamically based on Euclidean distance between agents.
+        """
+        N = positions.size(0)
+        dist_matrix = torch.cdist(positions, positions, p=2)
+        adjacency = (dist_matrix < self.comm_radius).float()
+        adjacency.fill_diagonal_(0)
+        return adjacency
+
+    def forward(self, local_obs, positions):
+        """
+        local_obs: [N, d_obs]
+        positions: [N, 2]  (x, y coordinates for communication graph)
+        """
+        adjacency = self.compute_adjacency(positions)
+        features = F.relu(self.encoder(local_obs))
+        msg_features = self.msg_passing(features, adjacency)
+        consensus_features = self.consensus(msg_features, adjacency)
+        action_logits = self.policy_head(consensus_features)
+        return F.softmax(action_logits, dim=-1), adjacency
+
+
+if __name__ == "__main__":
+    # Example: 5 UAVs communicating under partial observability
+    N_AGENTS = 5
+    STATE_DIM = 8
+    HIDDEN_DIM = 32
+
+    controller = CommunicationAwareController(N_AGENTS, STATE_DIM, HIDDEN_DIM)
+    positions = torch.rand(N_AGENTS, 2)
+    local_obs = torch.rand(N_AGENTS, STATE_DIM)
+
+    actions, adjacency = controller(local_obs, positions)
+
+    print("=== Communication-Aware Controller Output ===")
+    print("Action Probabilities:\n", actions)
+    print("Adjacency Matrix (Dynamic Links):\n", adjacency)
+
+
