@@ -1,0 +1,76 @@
+import os
+import numpy as np
+import torch
+import argparse
+from train_meta import StochasticMetaLearner
+from env_agent import PartialObservableEnv
+from uncertainty_bayesian_layer import UncertaintyAwarePolicy
+from evaluate_zero_shot import ZeroShotEvaluator
+
+def setup_environment(env_name="multi_uav", n_agents=5, state_dim=10, action_dim=4):
+    """
+    Setup environment for training or evaluation based on input config.
+    """
+    if env_name == "multi_uav":
+        env = PartialObservableEnv(n_agents=n_agents, state_dim=state_dim, action_dim=action_dim)
+    else:
+        raise ValueError("Unknown environment name")
+    return env
+
+def run_experiment(meta_learner, n_episodes=100, eval_tasks=10):
+    """
+    Main function for running the ZSM²RL experiment, either in simulation or real-world setup.
+    """
+    # Setup environment
+    env = setup_environment()
+
+    # Run training phase for meta-learning
+    for episode in range(n_episodes):
+        total_reward = 0
+        for agent in meta_learner.agents:
+            log_probs, rewards = meta_learner.sample_episode(agent)
+            returns = meta_learner.compute_returns(rewards)
+            meta_learner.meta_update(log_probs, returns)
+            total_reward += np.sum(rewards)
+
+        print(f"Episode {episode+1}/{n_episodes} | Total Reward: {total_reward}")
+
+    # Zero-shot Evaluation after training
+    evaluator = ZeroShotEvaluator(meta_learner)
+    results = evaluator.run_zero_shot()
+    evaluator.summarize_results()
+
+    # Export results for analysis
+    import pandas as pd
+    df = pd.DataFrame(results)
+    df.to_csv("experiment_results.csv", index=False)
+
+    return df
+
+def main():
+    parser = argparse.ArgumentParser(description="ZSM²RL Experiment Launcher")
+    parser.add_argument("--n_episodes", type=int, default=100, help="Number of training episodes")
+    parser.add_argument("--eval_tasks", type=int, default=10, help="Number of tasks for zero-shot evaluation")
+    parser.add_argument("--meta_lr", type=float, default=1e-4, help="Meta-learning learning rate")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for the agents")
+    args = parser.parse_args()
+
+    # Initialize the meta-learner
+    meta_learner = StochasticMetaLearner(lr=args.lr, meta_lr=args.meta_lr)
+
+    # Run the experiment and collect results
+    results = run_experiment(meta_learner, n_episodes=args.n_episodes, eval_tasks=args.eval_tasks)
+    
+    # Log the results
+    print("\n=== Experiment Completed ===")
+    print(f"Results saved to experiment_results.csv")
+    print(results.head())
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+python launch_experiment.py --n_episodes 100 --eval_tasks 10 --meta_lr 1e-4 --lr 3e-4
