@@ -1,0 +1,125 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+def load_log_data(file_name="uav_mission_log.csv"):
+    """
+    Load the experiment log data from a CSV file.
+    """
+    return pd.read_csv(file_name)
+
+def plot_control_action(data):
+    """
+    Plot the control action distribution (e.g., velocity commands) over time.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(data["Timestamp"], np.array(data["Action"]).T, label=["x", "y", "z", "yaw"])
+    plt.xlabel("Timestamp (s)")
+    plt.ylabel("Control Action")
+    plt.title("Control Actions Over Time")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_uncertainty(data):
+    """
+    Plot the uncertainty (log variance) for each time step of the experiment.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(data["Timestamp"], data["Uncertainty"], label="Uncertainty (logvar)")
+    plt.xlabel("Timestamp (s)")
+    plt.ylabel("Uncertainty")
+    plt.title("Uncertainty Over Time")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_reward_distribution(data):
+    """
+    Plot the reward distribution over multiple episodes or time steps.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.hist(data["Reward"], bins=50, color='skyblue', edgecolor='black')
+    plt.xlabel("Reward")
+    plt.ylabel("Frequency")
+    plt.title("Reward Distribution")
+    plt.grid(True)
+    plt.show()
+
+def plot_multi_metric_comparison(log_file_1="experiment_results.csv", log_file_2="uav_mission_log.csv"):
+    """
+    Compare multiple performance metrics (e.g., Reward, Uncertainty) across different experiments or tasks.
+    """
+    data_1 = pd.read_csv(log_file_1)
+    data_2 = pd.read_csv(log_file_2)
+    
+    fig, axes = plt.subplots(2, 1, figsize=(10, 12))
+
+    # Reward Comparison
+    sns.lineplot(x='Noise', y='Avg Reward', data=data_1, label="Experiment 1 (Simulation)", ax=axes[0])
+    sns.lineplot(x='Noise', y='Avg Reward', data=data_2, label="Experiment 2 (Real-World)", ax=axes[0])
+    axes[0].set_title("Reward Comparison Between Simulation and Real-World")
+    axes[0].set_xlabel("Noise Level")
+    axes[0].set_ylabel("Average Reward")
+    axes[0].grid(True)
+
+    # Uncertainty Comparison
+    sns.lineplot(x='Noise', y='Avg Uncertainty', data=data_1, label="Experiment 1 (Simulation)", ax=axes[1])
+    sns.lineplot(x='Noise', y='Avg Uncertainty', data=data_2, label="Experiment 2 (Real-World)", ax=axes[1])
+    axes[1].set_title("Uncertainty Comparison Between Simulation and Real-World")
+    axes[1].set_xlabel("Noise Level")
+    axes[1].set_ylabel("Average Uncertainty")
+    axes[1].grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+def save_plots(file_name="evaluation_plots.png"):
+    """
+    Save all plots into a single image for reporting purposes.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # Control Action Plot
+    plot_control_action(axes[0, 0])
+    
+    # Uncertainty Plot
+    plot_uncertainty(axes[0, 1])
+    
+    # Reward Distribution Plot
+    plot_reward_distribution(axes[1, 0])
+    
+    # Multi-Metric Comparison
+    plot_multi_metric_comparison(axes[1, 1])
+
+    plt.tight_layout()
+    plt.savefig(file_name)
+    plt.close()
+    print(f"Plots saved to {file_name}")
+
+def main():
+    log_file = "uav_mission_log.csv"
+    data = load_log_data(log_file)
+    
+    # Generate individual plots
+    plot_control_action(data)
+    plot_uncertainty(data)
+    plot_reward_distribution(data)
+    
+    # Save combined plots
+    save_plots(file_name="evaluation_plots.png")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+python visualize_results.py
+
+
+
+
+
+
