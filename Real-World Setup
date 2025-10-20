@@ -1,0 +1,224 @@
+proceed with A7: Real-World Setup Integration (ros_uav_control.py)
+
+# Install ROS and MAVROS
+sudo apt update
+sudo apt install ros-noetic-mavros ros-noetic-mavros-extras
+
+
+import rospy
+import numpy as np
+from std_msgs.msg import Float64
+from geometry_msgs.msg import Twist
+from mavros_msgs.msg import State
+from mavros import setpoint
+from torch import nn
+import torch
+from uncertainty_bayesian_layer import UncertaintyAwarePolicy
+
+class ROSUAVController:
+    """
+    Interface for real-time control of UAVs using ROS and PX4 (offboard control).
+    Communicates with the trained ZSM²RL policy, adapting it for real-world deployment.
+    """
+
+    def __init__(self, model: nn.Module, uav_id=0, action_dim=4, topic_prefix='/uav0'):
+        """
+        :param model: The trained ZSM²RL policy model
+        :param uav_id: Unique ID for each UAV (if running multiple UAVs)
+        :param action_dim: Action space dimension (e.g., 4 for continuous control in 3D space + yaw)
+        :param topic_prefix: ROS topic prefix to distinguish multiple UAVs
+        """
+        self.model = model
+        self.uav_id = uav_id
+        self.action_dim = action_dim
+        self.topic_prefix = topic_prefix
+        
+        self.current_state = None  # Placeholder for UAV state
+        self.position = None  # Placeholder for position
+        self.state_sub = rospy.Subscriber(f"{self.topic_prefix}/state", State, self.state_callback)
+        self.cmd_pub = rospy.Publisher(f"{self.topic_prefix}/cmd_vel", Twist, queue_size=10)
+        
+    def state_callback(self, data: State):
+        """ Callback function to capture UAV state (pose, velocity) """
+        self.current_state = data
+        self.position = np.array([data.pose.position.x, data.pose.position.y, data.pose.position.z])
+    
+    def get_action(self, obs: np.ndarray):
+        """ 
+        Get control action from the trained ZSM²RL model
+        Converts the policy output into the appropriate control commands for the UAV
+        """
+        action, updated_belief, mu, logvar = self.model(torch.tensor(obs, dtype=torch.float32))
+        # Control action is assumed to be continuous (e.g., x, y, z, yaw rate)
+        action = action.cpu().numpy()
+        return action
+
+    def send_control(self, action: np.ndarray):
+        """
+        Sends control command (action) to the UAV using ROS.
+        Converts the policy output into Twist message (linear and angular velocities).
+        """
+        msg = Twist()
+        msg.linear.x = action[0]
+        msg.linear.y = action[1]
+        msg.linear.z = action[2]
+        msg.angular.z = action[3]
+        self.cmd_pub.publish(msg)
+
+    def execute(self, observation: np.ndarray):
+        """
+        Execute the control action based on the model’s output.
+        Converts observation (state) into the UAV control action and sends it.
+        """
+        action = self.get_action(observation)
+        self.send_control(action)
+
+def run_ros_uav_control():
+    """ Main loop for controlling UAV in real-time with ROS offboard control """
+    rospy.init_node('zsm2rl_uav_control_node', anonymous=True)
+    
+    # Load the trained model
+    model = UncertaintyAwarePolicy(state_dim=10, action_dim=4)  # Define dimensions
+    model.load_state_dict(torch.load("trained_model.pth"))  # Load the model weights
+
+    # Create UAV controller
+    uav_controller = ROSUAVController(model=model, uav_id=0)
+
+    # Main control loop
+    rate = rospy.Rate(20)  # 20 Hz
+    while not rospy.is_shutdown():
+        if uav_controller.current_state:
+            # Get observation (state) from UAV
+            obs = np.array([uav_controller.position[0], uav_controller.position[1], uav_controller.position[2]])
+
+            # Execute action based on the policy
+            uav_controller.execute(obs)
+        
+        rate.sleep()
+
+if __name__ == "__main__":
+    run_ros_uav_control()
+
+
+
+python ros_uav_control.py
+
+
+import rospy
+import numpy as np
+from std_msgs.msg import Float64
+from geometry_msgs.msg import Twist
+from mavros_msgs.msg import State, PositionTarget
+import torch
+from uncertainty_bayesian_layer import UncertaintyAwarePolicy
+import pandas as pd
+from time import time
+
+class UAVRealTimeLogger:
+    """
+    Logs real-time performance data during UAV operations, tracking key metrics
+    such as reward, uncertainty, action history, and system performance.
+    """
+
+    def __init__(self, model: torch.nn.Module, uav_id=0, action_dim=4, topic_prefix='/uav0'):
+        self.model = model
+        self.uav_id = uav_id
+        self.action_dim = action_dim
+        self.topic_prefix = topic_prefix
+        
+        self.position = None
+        self.velocity = None
+        self.reward_log = []
+        self.uncertainty_log = []
+        self.action_log = []
+        self.timestamp_log = []
+        
+        # Initialize ROS Subscribers and Publishers
+        self.state_sub = rospy.Subscriber(f"{self.topic_prefix}/state", State, self.state_callback)
+        self.cmd_pub = rospy.Publisher(f"{self.topic_prefix}/cmd_vel", Twist, queue_size=10)
+        
+    def state_callback(self, data: State):
+        """ Callback to capture UAV state (position, velocity) """
+        self.position = np.array([data.pose.position.x, data.pose.position.y, data.pose.position.z])
+        self.velocity = np.array([data.twist.linear.x, data.twist.linear.y, data.twist.linear.z])
+    
+    def get_action(self, obs: np.ndarray):
+        """ Get action from the trained policy model """
+        action, updated_belief, mu, logvar = self.model(torch.tensor(obs, dtype=torch.float32))
+        action = action.cpu().detach().numpy()
+        uncertainty = torch.mean(torch.exp(logvar)).item()  # Uncertainty is exp(logvar)
+        return action, uncertainty
+
+    def log_data(self, action, reward, uncertainty, timestamp):
+        """ Log the control action, reward, and uncertainty data """
+        self.reward_log.append(reward)
+        self.uncertainty_log.append(uncertainty)
+        self.action_log.append(action)
+        self.timestamp_log.append(timestamp)
+
+    def send_control(self, action: np.ndarray):
+        """ Send control commands to UAV """
+        msg = Twist()
+        msg.linear.x = action[0]
+        msg.linear.y = action[1]
+        msg.linear.z = action[2]
+        msg.angular.z = action[3]
+        self.cmd_pub.publish(msg)
+
+    def execute(self, observation: np.ndarray, reward: float):
+        """ Execute the policy action and log the data """
+        action, uncertainty = self.get_action(observation)
+        self.send_control(action)
+        timestamp = time()
+        self.log_data(action, reward, uncertainty, timestamp)
+
+    def save_logs(self, file_name="uav_performance_log.csv"):
+        """ Save logged data to CSV """
+        log_data = {
+            "Timestamp": self.timestamp_log,
+            "Action": self.action_log,
+            "Reward": self.reward_log,
+            "Uncertainty": self.uncertainty_log
+        }
+        df = pd.DataFrame(log_data)
+        df.to_csv(file_name, index=False)
+        print(f"Data saved to {file_name}")
+
+def run_real_time_logging():
+    """ Main loop for real-time UAV logging and evaluation in ROS environment """
+    rospy.init_node('zsm2rl_uav_logging_node', anonymous=True)
+    
+    # Load the trained model
+    model = UncertaintyAwarePolicy(state_dim=10, action_dim=4)  # Define dimensions
+    model.load_state_dict(torch.load("trained_model.pth"))  # Load the trained weights
+
+    # Initialize the UAV Logger
+    uav_logger = UAVRealTimeLogger(model=model, uav_id=0)
+
+    # Main logging loop
+    rate = rospy.Rate(20)  # 20 Hz
+    while not rospy.is_shutdown():
+        if uav_logger.position is not None:
+            # Get observation (state) from UAV
+            obs = np.array([uav_logger.position[0], uav_logger.position[1], uav_logger.position[2]])
+
+            # Execute action based on the policy
+            reward = np.random.uniform(-1, 1)  # Placeholder for reward (can be task-specific)
+            uav_logger.execute(obs, reward)
+
+        rate.sleep()
+
+    # Save collected data after mission completion
+    uav_logger.save_logs(file_name="uav_mission_log.csv")
+
+if __name__ == "__main__":
+    run_real_time_logging()
+
+
+
+python ros_uav_eval.py
+
+
+
+
+
