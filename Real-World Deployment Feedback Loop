@@ -1,0 +1,157 @@
+import rospy
+import numpy as np
+from mavros_msgs.msg import State, PositionTarget
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float64
+import torch
+from uncertainty_bayesian_layer import UncertaintyAwarePolicy
+import pandas as pd
+from time import time
+
+class UAVFeedbackLoop:
+    """
+    Implements the feedback loop in a real-world deployment, allowing the UAVs to adjust
+    their behavior based on feedback from the environment and performance metrics.
+    This uses ROS to control the UAV and ZSM²RL for dynamic adaptation.
+    """
+
+    def __init__(self, model: torch.nn.Module, uav_id=0, action_dim=4, topic_prefix='/uav0'):
+        """
+        :param model: The trained ZSM²RL policy model
+        :param uav_id: Unique ID for each UAV (if running multiple UAVs)
+        :param action_dim: Action space dimension (e.g., 4 for continuous control in 3D space + yaw)
+        :param topic_prefix: ROS topic prefix to distinguish multiple UAVs
+        """
+        self.model = model
+        self.uav_id = uav_id
+        self.action_dim = action_dim
+        self.topic_prefix = topic_prefix
+        
+        self.position = None
+        self.velocity = None
+        self.reward_log = []
+        self.uncertainty_log = []
+        self.action_log = []
+        self.timestamp_log = []
+        
+        # Initialize ROS Subscribers and Publishers
+        self.state_sub = rospy.Subscriber(f"{self.topic_prefix}/state", State, self.state_callback)
+        self.cmd_pub = rospy.Publisher(f"{self.topic_prefix}/cmd_vel", Twist, queue_size=10)
+        self.reward_pub = rospy.Publisher(f"{self.topic_prefix}/reward", Float64, queue_size=10)
+        
+    def state_callback(self, data: State):
+        """ Callback to capture UAV state (position, velocity) """
+        self.position = np.array([data.pose.position.x, data.pose.position.y, data.pose.position.z])
+        self.velocity = np.array([data.twist.linear.x, data.twist.linear.y, data.twist.linear.z])
+
+    def get_action(self, obs: np.ndarray):
+        """ Get action from the trained policy model """
+        action, updated_belief, mu, logvar = self.model(torch.tensor(obs, dtype=torch.float32))
+        action = action.cpu().detach().numpy()
+        uncertainty = torch.mean(torch.exp(logvar)).item()  # Uncertainty is exp(logvar)
+        return action, uncertainty
+
+    def log_data(self, action, reward, uncertainty, timestamp):
+        """ Log the control action, reward, and uncertainty data """
+        self.reward_log.append(reward)
+        self.uncertainty_log.append(uncertainty)
+        self.action_log.append(action)
+        self.timestamp_log.append(timestamp)
+
+    def send_control(self, action: np.ndarray):
+        """ Send control commands to UAV """
+        msg = Twist()
+        msg.linear.x = action[0]
+        msg.linear.y = action[1]
+        msg.linear.z = action[2]
+        msg.angular.z = action[3]
+        self.cmd_pub.publish(msg)
+
+    def send_reward(self, reward: float):
+        """ Publish the reward to monitor performance """
+        reward_msg = Float64()
+        reward_msg.data = reward
+        self.reward_pub.publish(reward_msg)
+
+    def execute(self, observation: np.ndarray, reward: float):
+        """ Execute the policy action and log the data """
+        action, uncertainty = self.get_action(observation)
+        self.send_control(action)
+        self.send_reward(reward)
+        timestamp = time()
+        self.log_data(action, reward, uncertainty, timestamp)
+
+    def adjust_behavior(self):
+        """ Adjust UAV's behavior in real-time based on feedback and performance metrics """
+        avg_reward = np.mean(self.reward_log[-100:])  # Reward over last 100 time steps
+        avg_uncertainty = np.mean(self.uncertainty_log[-100:])  # Uncertainty over last 100 time steps
+
+        # Example: If uncertainty is too high, reduce action aggressiveness
+        if avg_uncertainty > 0.8:
+            print(f"High uncertainty detected. Reducing action aggressiveness.")
+            for i in range(len(self.action_log)):
+                self.action_log[i] *= 0.5  # Halve the control inputs
+        # Adjust behavior based on reward trends (e.g., lower reward, explore more)
+        elif avg_reward < 0.5:
+            print(f"Low reward detected. Increasing exploration.")
+            # Increase exploration (could involve higher exploration noise, different exploration strategies)
+
+    def save_logs(self, file_name="uav_feedback_log.csv"):
+        """ Save logged data to CSV """
+        log_data = {
+            "Timestamp": self.timestamp_log,
+            "Action": self.action_log,
+            "Reward": self.reward_log,
+            "Uncertainty": self.uncertainty_log
+        }
+        df = pd.DataFrame(log_data)
+        df.to_csv(file_name, index=False)
+        print(f"Data saved to {file_name}")
+
+def run_feedback_loop():
+    """ Main loop for real-time UAV feedback and adaptation in ROS environment """
+    rospy.init_node('zsm2rl_uav_feedback_loop_node', anonymous=True)
+    
+    # Load the trained model
+    model = UncertaintyAwarePolicy(state_dim=10, action_dim=4)  # Define dimensions
+    model.load_state_dict(torch.load("trained_model.pth"))  # Load the trained weights
+
+    # Initialize the UAV Feedback Loop
+    uav_feedback = UAVFeedbackLoop(model=model, uav_id=0)
+
+    # Main feedback loop
+    rate = rospy.Rate(20)  # 20 Hz
+    while not rospy.is_shutdown():
+        if uav_feedback.position is not None:
+            # Get observation (state) from UAV
+            obs = np.array([uav_feedback.position[0], uav_feedback.position[1], uav_feedback.position[2]])
+
+            # Reward Placeholder (can be task-specific)
+            reward = np.random.uniform(-1, 1)
+
+            # Execute action based on policy and log data
+            uav_feedback.execute(obs, reward)
+
+            # Adjust behavior based on performance feedback
+            uav_feedback.adjust_behavior()
+
+        rate.sleep()
+
+    # Save the logged data to CSV after the loop ends
+    uav_feedback.save_logs(file_name="uav_feedback_log.csv")
+
+if __name__ == "__main__":
+    run_feedback_loop()
+
+
+
+
+
+
+python ros_uav_feedback.py
+
+
+
+
+
+
