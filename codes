@@ -1,0 +1,402 @@
+# src/algos/ppo_trainer.py
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+import numpy as np
+from typing import Dict, Any
+
+EPS = 1e-8
+
+class ActorCritic(nn.Module):
+    def __init__(self, obs_dim, act_dim, hidden_sizes=[256,256]):
+        super().__init__()
+        layers = []
+        prev = obs_dim
+        for h in hidden_sizes:
+            layers.append(nn.Linear(prev, h))
+            layers.append(nn.ReLU())
+            prev = h
+        self.shared = nn.Sequential(*layers)
+        self.actor = nn.Sequential(nn.Linear(prev, 128), nn.ReLU(), nn.Linear(128, act_dim))
+        self.critic = nn.Sequential(nn.Linear(prev, 128), nn.ReLU(), nn.Linear(128, 1))
+        self.apply(self._init_weights)
+
+    def forward(self, x):
+        h = self.shared(x)
+        logits = self.actor(h)
+        value = self.critic(h)
+        return logits, value.squeeze(-1)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_uniform_(m.weight, a=0.01)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+
+def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
+    advantages = []
+    gae = 0
+    values = np.append(values, 0)
+    for t in reversed(range(len(rewards))):
+        delta = rewards[t] + gamma * values[t+1] * (1 - dones[t]) - values[t]
+        gae = delta + gamma * lam * (1 - dones[t]) * gae
+        advantages.insert(0, gae)
+    return np.array(advantages)
+
+class PPOTrainer:
+    def __init__(self, obs_dim, act_dim, cfg: Dict[str,Any], device='cpu'):
+        self.device = device
+        self.model = ActorCritic(obs_dim, act_dim, cfg.get('hidden_sizes',[256,256])).to(device)
+        self.optimizer = Adam(self.model.parameters(), lr=cfg.get('lr',3e-4))
+        self.clip = cfg.get('clip', 0.2)
+        self.ent_coef = cfg.get('ent_coef', 0.01)
+        self.vf_coef = cfg.get('vf_coef', 1.0)
+        self.max_grad_norm = cfg.get('max_grad_norm', 0.5)
+        self.epochs = cfg.get('ppo_epochs', 10)
+        self.batch_size = cfg.get('ppo_batch_size', 64)
+
+    def select_action(self, obs):
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        logits, value = self.model(obs_t)
+        # Gaussian continuous actions
+        mu = torch.tanh(logits)
+        # For simplicity we use fixed std
+        std = 0.1
+        dist = torch.distributions.Normal(mu, std)
+        action = dist.sample()
+        logp = dist.log_prob(action).sum(-1)
+        return action.cpu().numpy(), logp.cpu().numpy(), value.detach().cpu().numpy()
+
+    def update(self, trajectories):
+        # trajectories: dict of arrays (obs, actions, logp, returns, adv)
+        obs = torch.tensor(trajectories['obs'], dtype=torch.float32, device=self.device)
+        actions = torch.tensor(trajectories['actions'], dtype=torch.float32, device=self.device)
+        old_logp = torch.tensor(trajectories['logp'], dtype=torch.float32, device=self.device)
+        returns = torch.tensor(trajectories['returns'], dtype=torch.float32, device=self.device)
+        advs = torch.tensor(trajectories['adv'], dtype=torch.float32, device=self.device)
+        advs = (advs - advs.mean()) / (advs.std() + EPS)
+
+        dataset_size = obs.shape[0]
+        for _ in range(self.epochs):
+            perm = np.random.permutation(dataset_size)
+            for i in range(0, dataset_size, self.batch_size):
+                idx = perm[i:i+self.batch_size]
+                batch_obs = obs[idx]
+                batch_actions = actions[idx]
+                batch_old_logp = old_logp[idx]
+                batch_returns = returns[idx]
+                batch_adv = advs[idx]
+
+                logits, values = self.model(batch_obs)
+                mu = torch.tanh(logits)
+                std = 0.1
+                dist = torch.distributions.Normal(mu, std)
+                logp = dist.log_prob(batch_actions).sum(-1)
+                entropy = dist.entropy().sum(-1).mean()
+
+                ratio = torch.exp(logp - batch_old_logp)
+                surr1 = ratio * batch_adv
+                surr2 = torch.clamp(ratio, 1.0 - self.clip, 1.0 + self.clip) * batch_adv
+                policy_loss = -torch.min(surr1, surr2).mean()
+                value_loss = ((batch_returns - values)**2).mean()
+                loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+        return True
+
+
+  # src/algos/pearl_encoder.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class PEARLEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_sizes=[128,128], latent_dim=16):
+        super().__init__()
+        layers=[]
+        prev=input_dim
+        for h in hidden_sizes:
+            layers.append(nn.Linear(prev,h)); layers.append(nn.ReLU())
+            prev=h
+        self.net = nn.Sequential(*layers)
+        self.mu = nn.Linear(prev, latent_dim)
+        self.logvar = nn.Linear(prev, latent_dim)
+        self.apply(self._init)
+
+    def _init(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.)
+
+    def forward(self, context):
+        # context: [B, context_dim]
+        h = self.net(context)
+        mu = self.mu(h)
+        logvar = self.logvar(h)
+        std = (0.5 * logvar).exp()
+        eps = torch.randn_like(std)
+        z = mu + eps * std
+        return z, mu, logvar
+
+
+  # src/algos/pearl_trainer.py
+import torch
+from torch.optim import Adam
+import numpy as np
+from src.algos.pearl_encoder import PEARLEncoder
+
+class PEARLTrainer:
+    def __init__(self, obs_dim, act_dim, cfg, device='cpu'):
+        self.device = device
+        self.cfg = cfg
+        self.latent_dim = cfg['model']['latent_dim']
+        self.encoder = PEARLEncoder(input_dim=obs_dim+act_dim+1, hidden_sizes=cfg['model']['context_hidden'], latent_dim=self.latent_dim).to(device)
+        # policy conditioned on z: simple MLP
+        from src.models.policy import PolicyNetwork
+        self.policy = PolicyNetwork(obs_dim + self.latent_dim, act_dim, cfg['model']['policy_hidden']).to(device)
+        self.policy_opt = Adam(self.policy.parameters(), lr=cfg['training']['lr'])
+        self.encoder_opt = Adam(self.encoder.parameters(), lr=cfg['training']['lr'])
+        self.kl_beta = cfg.get('kl_beta', 0.1)
+
+    def infer_z(self, context_batch):
+        with torch.no_grad():
+            z, mu, logvar = self.encoder(context_batch.to(self.device))
+        return z
+
+    def update(self, task_contexts, task_rollouts):
+        """
+        task_contexts: list of context tensors for each task (B_task x context_dim)
+        task_rollouts: list of rollout tensors for policy update
+        """
+        total_policy_loss = 0
+        total_kl = 0
+        for context, rollouts in zip(task_contexts, task_rollouts):
+            z, mu, logvar = self.encoder(context.to(self.device))
+            # flatten obs + tile z
+            obs = rollouts['obs'].to(self.device)  # [N, T, obs_dim]
+            B,T,_ = obs.shape
+            z_tile = z.unsqueeze(1).expand(B,T,-1).reshape(B*T,-1)
+            obs_flat = obs.reshape(B*T, -1)
+            inp = torch.cat([obs_flat, z_tile], dim=-1)
+            actions = self.policy(inp)
+            # placeholder supervised loss using predicted actions vs. taken actions (behavior cloning style)
+            act_target = rollouts['actions'].reshape(B*T, -1).to(self.device)
+            loss = ((actions - act_target)**2).mean()
+            # KL regularizer toward N(0,I)
+            kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1).mean()
+            total = loss + self.kl_beta * kl
+            self.policy_opt.zero_grad(); self.encoder_opt.zero_grad()
+            total.backward()
+            self.policy_opt.step(); self.encoder_opt.step()
+            total_policy_loss += loss.item()
+            total_kl += kl.item()
+        return total_policy_loss / len(task_contexts), total_kl / len(task_contexts)
+
+
+  # src/envs/sim_wrappers.py
+import os
+import gym
+import numpy as np
+
+def make_env(name, seed=0, render=False):
+    """
+    Factory to make different simulators based on name string.
+    name example: "mujoco:Humanoid-v4" or "pybullet:KukaGymEnv-v0" or "carla:Town01"
+    """
+    if name.startswith("mujoco:"):
+        env_id = name.split("mujoco:")[1]
+        # Ensure mujoco_py or mujoco is installed, MuJoCo licences set
+        env = gym.make(env_id)
+        env.seed(seed)
+        return env
+    elif name.startswith("pybullet:"):
+        import pybullet_envs  # ensures env registration
+        env_id = name.split("pybullet:")[1]
+        env = gym.make(env_id)
+        env.seed(seed)
+        return env
+    else:
+        # fallback to your custom MultiUAVEnv
+        from src.envs.multi_uav_env import MultiUAVEnv
+        return MultiUAVEnv(num_agents=5, horizon=200)
+
+
+  # scripts/launch_sim.py
+#!/usr/bin/env python3
+import argparse
+from src.envs.sim_wrappers import make_env
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--env", default="multi_uav")
+    args = p.parse_args()
+    env = make_env(args.env)
+    print("Created env:", env)
+    o = env.reset()
+    print("Initial obs shape:", np.array(o).shape)
+
+
+  # src/algos/dirichlet_estimator.py
+import numpy as np
+import torch
+
+def sample_dirichlet_perturbation(k, alpha=1.0):
+    # returns vector in simplex of size k
+    v = np.random.gamma(shape=alpha, scale=1.0, size=k)
+    return v / (v.sum() + 1e-12)
+
+def dirichlet_gradient_estimate(f, x, k=None, n_samples=32, alpha=0.5):
+    """
+    f: black-box function mapping simplex points to scalar reward (expects numpy array)
+    x: reference point in simplex (numpy)
+    returns estimated gradient wrt simplex components (finite-difference style)
+    This is a research placeholder; refine with theory from Lam & Zhang.
+    """
+    if k is None:
+        k = x.shape[0]
+    est = np.zeros_like(x)
+    base = f(x)
+    for _ in range(n_samples):
+        d = sample_dirichlet_perturbation(k, alpha=alpha)
+        eps = 1e-3
+        xp = (x + eps * d)
+        xp = np.maximum(xp, 1e-12)
+        xp = xp / xp.sum()
+        val = f(xp)
+        est += (val - base) * (d / eps)
+    est /= n_samples
+    return est
+
+
+  # src/sim2real/ros_offboard.py
+# Note: this uses roslibpy for non-ROS environments or as a template for rospy
+import time
+import json
+import numpy as np
+
+# Example for roslibpy use (pure Python ROS bridge)
+try:
+    import roslibpy
+except Exception:
+    roslibpy = None
+
+class ROSOffboardBridge:
+    def __init__(self, host='localhost', port=9090):
+        if roslibpy is None:
+            raise RuntimeError("roslibpy not installed. Install or replace with rospy bindings.")
+        self.client = roslibpy.Ros(host=host, port=port)
+        self.client.run()
+        # Topics: adapt to your system
+        self.pub_cmd = roslibpy.Topic(self.client, '/uav/cmd_vel', 'geometry_msgs/Twist')
+        # subscribe to vision/thermal topics as needed
+        self.sub_odom = roslibpy.Topic(self.client, '/uav/odom', 'nav_msgs/Odometry')
+
+    def send_velocity(self, vx, vy, vz, yaw_rate=0.0):
+        twist = roslibpy.Message({
+            'linear': {'x': float(vx), 'y': float(vy), 'z': float(vz)},
+            'angular': {'x': 0.0, 'y': 0.0, 'z': float(yaw_rate)}
+        })
+        self.pub_cmd.publish(twist)
+
+    def close(self):
+        self.pub_cmd.unadvertise()
+        self.client.terminate()
+
+
+  # Dockerfile for reproducible experiments
+FROM python:3.9-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential git wget ffmpeg libgl1-mesa-glx \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY requirements.txt /workspace/
+RUN pip install --upgrade pip
+RUN pip install -r requirements.txt
+
+COPY . /workspace
+ENV PYTHONPATH=/workspace:$PYTHONPATH
+
+CMD ["bash"]
+
+
+  .PHONY: build run train test lint
+
+build:
+	docker build -t zsm2rl:latest .
+
+run:
+	docker run --rm -it --gpus all -v $(PWD):/workspace -p 8888:8888 zsm2rl:latest
+
+train:
+	python scripts/train_meta.py --config configs/default.yaml
+
+test:
+	pytest -q
+
+lint:
+	flake8 src
+
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run tests
+        run: |
+          pytest -q
+      - name: Lint
+        run: |
+          python -m pip install flake8
+          flake8 src || true
+
+
+  # tests/test_env_basic.py
+import pytest
+from src.envs.multi_uav_env import MultiUAVEnv
+
+def test_env_reset_step():
+    env = MultiUAVEnv(num_agents=5, horizon=50)
+    obs = env.reset()
+    assert obs.shape == (5, env.observation_space.shape[1])
+    action = np.zeros(env.action_space.shape)
+    obs2, reward, done, info = env.step(action)
+    assert obs2.shape == obs.shape
+
+
+  # tests/test_pearl_encoder.py
+import torch
+from src.algos.pearl_encoder import PEARLEncoder
+
+def test_encoder_shapes():
+    enc = PEARLEncoder(input_dim=20, hidden_sizes=[32,32], latent_dim=8)
+    x = torch.randn(4,20)
+    z, mu, logvar = enc(x)
+    assert z.shape == (4,8)
+    assert mu.shape == (4,8)
+    assert logvar.shape == (4,8)
+
+
+  
